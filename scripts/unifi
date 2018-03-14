@@ -1,0 +1,176 @@
+#!/bin/sh -
+
+LOG="/var/log/zabbix/unifi_mon.log"
+LOG_ENABLE="YES"
+
+USERNAME="admin"
+PASSWORD="secret"
+BASEURL="https://127.0.0.1:8443"
+COOKIE="/tmp/unifi_mon_cookie"
+CURL=$(which curl)
+JQ=$(which jq)
+
+log() {
+    if [ "$LOG_ENABLE" = "YES" ]; then
+        echo "`date +"[%d/%b/%Y:%H:%M:%S %z]"` ${@}" >> $LOG
+    fi
+}
+
+if [ ! -x "$CURL" ]; then
+    log "Проверьте установлен ли curl и переменную \$PATH=$PATH"
+    exit 1
+fi
+
+if [ ! -x "$JQ" ]; then
+    log "Проверьте установлен ли jq и переменную \$PATH=$PATH"
+    exit 1
+fi
+
+JQ="$JQ -c -M"
+
+curl_cmd="$CURL -s --cookie $COOKIE --cookie-jar $COOKIE --insecure "
+
+key_list="l"
+key_site="s"
+key_dev="d"
+key_cli="c"
+
+lopt_dev="devices"
+lopt_cli="clients"
+lopt_site="sites"
+
+help() {
+cat << EOF
+ $0 [ -$key_list <$lopt_dev|$lopt_cli|$lopt_site> ]
+ $0 [ -$key_dev <mac address> -$key_site <site name> ]
+ $0 [ -$key_cli <mac address> -$key_site <site name> ]
+ $0 [ -$key_site <site name> ]
+   -$key_list получение списка:
+    '$lopt_dev' устройств,
+    '$lopt_cli' клиентов,
+    '$lopt_site' сайтов;
+   -$key_dev <mac address> -$key_site <site name>
+    будет выведена информация об устройстве из заданого сайта
+   -$key_cli <mac address> -$key_site <site name>
+    будет выведена информация о клиенте из заданого сайта
+   -$key_site <site name> если указан конкретный сайт,
+    то будет выведена суммарная информация о нём
+   -h|-? показ данной справки
+EOF
+}
+
+if [ -z "$*" ]; then
+    help
+    exit 1
+fi
+
+while getopts "$key_list:$key_dev:$key_cli:$key_site:h?" OPTION; do
+    case $OPTION in
+        $key_list)
+            list_arg=$OPTARG
+            ;;
+        $key_dev)
+            dev_arg=$OPTARG
+            ;;
+        $key_cli)
+            cli_arg=$OPTARG
+            ;;
+        $key_site)
+            site_arg=$OPTARG
+            ;;
+        h|?)
+            help
+            ;;
+    esac
+done
+
+unifi_login() {
+    ${curl_cmd} --data "{'username':'$USERNAME', 'password':'$PASSWORD'}" "$BASEURL/api/login"
+}
+
+unifi_logout() {
+    ${curl_cmd} $BASEURL/logout
+    rm $COOKIE
+}
+
+unifi_stat_sites() {
+    ${curl_cmd} "$BASEURL/api/stat/sites"
+}
+
+unifi_stat_device() {
+    ${curl_cmd} "$BASEURL/api/s/$1/stat/device/$2"
+}
+
+unifi_stat_sta() {
+    ${curl_cmd} "$BASEURL/api/s/$1/stat/sta/$2"
+}
+
+unifi_stat_health() {
+    ${curl_cmd} "$BASEURL/api/s/$1/stat/health"
+}
+
+discovery_out() {
+    echo $@ | sed -E 's/^(.*),$/{"data":[\1]}/g'
+}
+
+login=$(unifi_login)
+
+is_logged=$(echo $login | $JQ '.meta.rc' | awk 'gsub("\"", "")')
+
+if [ $is_logged != "ok" ]; then
+    log "Не удалось авторизовться, ответ сервера:\n$login"
+fi
+
+if [ ! -z "$dev_arg" -a ! -z "$site_arg" ]; then
+    unifi_stat_device "$site_arg" "$dev_arg" | $JQ '.data[]'
+    exit
+fi
+
+if [ ! -z "$cli_arg" -a ! -z "$site_arg" ]; then
+    unifi_stat_sta "$site_arg" "$cli_arg" | $JQ '.data[]'
+    exit
+fi
+
+if [ ! -z "$site_arg" ]; then
+    unifi_stat_health "$site_arg" | $JQ '.data[0]'
+    exit
+fi
+
+sites=$(unifi_stat_sites)
+log "JSON список сайтов:\n$sites"
+out=""
+
+if [ "$list_arg" = "$lopt_site" ]; then
+    out=$(echo $sites | $JQ ' .data[] | {desc, name}' | \
+    sed -e "s/"name"/"{#UNIFI_SITE_NAME}"/g" -e "s/"desc"/"{#UNIFI_SITE_DESCR}"/g" -e "s/}$/},/g")
+    discovery_out $out
+    exit
+fi
+
+if [ "$list_arg" = "$lopt_dev" ]; then
+    for site in `echo $sites | $JQ ' .data[] | .name'`; do
+        site=$(echo $site | awk 'gsub("\"", "")')
+        devices=$(unifi_stat_device $site)
+        log "JSON список устройств сайта $site:\n$devices"
+        out="$out $(echo $devices | \
+        $JQ ' .data[] | {ip, mac, name}' | \
+        sed -e "s/"mac"/"{#UNIFI_DEV_MAC}"/g" -e "s/"ip"/"{#UNIFI_DEV_IP}"/g" -e "s/"name"/"{#UNIFI_DEV_NAME}"/g" -e "s/}$/, \"{#UNIFI_DEV_SITE}\":\"$site\"},/g")"
+    done
+    discovery_out $out
+    exit
+fi
+
+if [ "$list_arg" = "$lopt_cli" ]; then
+    for site in `echo $sites | $JQ ' .data[] | .attr_hidden_id'`; do
+        site=$(echo $site | awk 'gsub("\"", "")')
+        clients=$(unifi_stat_sta $site)
+        log "JSON список клиентов привязанных к сайту $site:\n$clients"
+        out="$out $(echo $clients | \
+        $JQ ' .data[] | {ip, mac, name}' | \
+        sed -e "s/"mac"/"{#UNIFI_CLI_MAC}"/g" -e "s/"ip"/"{#UNIFI_CLI_IP}"/g" -e "s/"name"/"{#UNIFI_CLI_NAME}"/g" -e "s/}$/, \"{#UNIFI_CLI_SITE}\":\"$site\"},/g" )"
+    done
+    discovery_out $out
+    exit
+fi
+
+help
